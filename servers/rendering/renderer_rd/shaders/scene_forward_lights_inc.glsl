@@ -141,18 +141,6 @@ void light_compute(hvec3 N, hvec3 L, hvec3 V, half A, hvec3 light_color, bool is
 		hvec3 B, hvec3 T, half anisotropy,
 #endif
 		inout hvec3 diffuse_light, inout hvec3 specular_light) {
-		
-		// Clamp inputs for stability (UE-style)
-	{
-		roughness = clamp(roughness, half(0.001), half(1.0));
-		metallic = clamp(metallic, half(0.0), half(1.0));
-		specular_amount = clamp(specular_amount, half(0.0), half(1.0));
-		alpha = clamp(alpha, half(0.0), half(1.0));
-		// Defensive normalize for custom windowing
-		N = normalize(N);
-		L = normalize(L);
-		V = normalize(V);
-	}
 	
 	
 #if defined(LIGHT_CODE_USED)
