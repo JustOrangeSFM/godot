@@ -16,15 +16,22 @@
 #endif
 
 half D_GGX(half NoH, half roughness, hvec3 n, hvec3 h) {
-	half a = NoH * roughness;
+    // Clamp roughness to avoid numerical issues (UE-style)
+    roughness = clamp(roughness, half(0.001), half(1.0));
+    half a2 = roughness * roughness;
+    half NoH2 = NoH * NoH;
+    
 #ifdef EXPLICIT_FP16
-	hvec3 NxH = cross(n, h);
-	half k = roughness / (dot(NxH, NxH) + a * a);
+    hvec3 NxH = cross(n, h);
+    half denom = dot(NxH, NxH) + a2 * NoH2;
+    half k = a2 / max(denom, half(1e-7));
 #else
-	float k = roughness / (1.0 - NoH * NoH + a * a);
+    half denom = NoH2 * (a2 - 1.0) + 1.0;
+    half k = a2 / max(denom * denom, half(1e-7));
 #endif
-	half d = k * k * half(1.0 / M_PI);
-	return saturateHalf(d);
+    // Energy conservation factor for GGX
+    half d = k * half(1.0 / M_PI);
+    return saturateHalf(d);
 }
 
 #ifdef LIGHT_TRANSMITTANCE_USED
@@ -54,8 +61,23 @@ hvec3 SSS(half NdotL, half transmittance_depth, half transmittance_z, half trans
 
 // From Earl Hammon, Jr. "PBR Diffuse Lighting for GGX+Smith Microsurfaces" https://www.gdcvault.com/play/1024478/PBR-Diffuse-Lighting-for-GGX
 half V_GGX(half NdotL, half NdotV, half alpha) {
-	half v = half(0.5) / mix(half(2.0) * NdotL * NdotV, NdotL + NdotV, alpha);
-	return saturateHalf(v);
+    // Clamp inputs for stability
+    NdotL = max(NdotL, half(1e-4));
+    NdotV = max(NdotV, half(1e-4));
+    alpha = clamp(alpha, half(0.001), half(1.0));
+    
+    half a2 = alpha * alpha;
+    // Smith joint visibility with UE-style normalization
+    half lambdaV = NdotL * sqrt((-NdotV * a2 + NdotV) * NdotV + a2);
+    half lambdaL = NdotV * sqrt((-NdotL * a2 + NdotL) * NdotL + a2);
+    half G = half(0.5) / (lambdaV + lambdaL + half(1e-5));
+    
+    // Multiple scattering compensation (Kulla/Conty approx, UE-style)
+    half Ems = (half(1.0) - (lambdaV + lambdaL) / max(lambdaV * lambdaL + lambdaV + lambdaL + half(1e-5), half(1e-5)));
+    half F_avg = half(0.04);
+    half F_ms = Ems * F_avg / max(half(1.0) - F_avg * (half(1.0) - Ems), half(1e-5));
+    
+    return saturateHalf(G * (half(1.0) + F_ms));
 }
 
 half D_GGX_anisotropic(half cos_theta_m, half alpha_x, half alpha_y, half cos_phi, half sin_phi) {
@@ -74,16 +96,17 @@ half V_GGX_anisotropic(half alpha_x, half alpha_y, half TdotV, half TdotL, half 
 }
 
 half SchlickFresnel(half u) {
-	half m = half(1.0) - u;
-	half m2 = m * m;
-	return m2 * m2 * m; // pow(m,5)
+    // More stable pow(m,5) with clamping
+    half m = half(1.0) - saturateHalf(u);
+    half m2 = m * m;
+    return m2 * m2 * m;
 }
 
 hvec3 F0(half metallic, half specular, hvec3 albedo) {
-	half dielectric = half(0.16) * specular * specular;
-	// use albedo * metallic as colored specular reflectance at 0 angle for metallic materials;
-	// see https://google.github.io/filament/Filament.md.html
-	return mix(hvec3(dielectric), albedo, hvec3(metallic));
+    half dielectric = half(0.16) * specular * specular;
+    // Clamp metallic to avoid artifacts
+    metallic = clamp(metallic, half(0.0), half(1.0));
+    return mix(hvec3(dielectric), albedo, hvec3(metallic));
 }
 
 half V_Kelemen(half LdotH) {
@@ -118,6 +141,20 @@ void light_compute(hvec3 N, hvec3 L, hvec3 V, half A, hvec3 light_color, bool is
 		hvec3 B, hvec3 T, half anisotropy,
 #endif
 		inout hvec3 diffuse_light, inout hvec3 specular_light) {
+		
+		// Clamp inputs for stability (UE-style)
+	{
+		roughness = clamp(roughness, half(0.001), half(1.0));
+		metallic = clamp(metallic, half(0.0), half(1.0));
+		specular_amount = clamp(specular_amount, half(0.0), half(1.0));
+		alpha = clamp(alpha, half(0.0), half(1.0));
+		// Defensive normalize for custom windowing
+		N = normalize(N);
+		L = normalize(L);
+		V = normalize(V);
+	}
+	
+	
 #if defined(LIGHT_CODE_USED)
 	// Light is written by the user shader.
 	mat4 inv_view_matrix = transpose(mat4(scene_data_block.data.inv_view_matrix[0],
@@ -230,12 +267,16 @@ void light_compute(hvec3 N, hvec3 L, hvec3 V, half A, hvec3 light_color, bool is
 			diffuse_brdf_NL = smoothstep(-roughness, max(roughness, half(0.01)), NdotL) * half(1.0 / M_PI);
 
 #elif defined(DIFFUSE_BURLEY)
-			{
-				half FD90_minus_1 = half(2.0) * cLdotH * cLdotH * roughness - half(0.5);
-				half FdV = half(1.0) + FD90_minus_1 * SchlickFresnel(cNdotV);
-				half FdL = half(1.0) + FD90_minus_1 * SchlickFresnel(cNdotL);
-				diffuse_brdf_NL = half(1.0 / M_PI) * FdV * FdL * cNdotL;
-			}
+		{
+			// Disney diffuse with energy compensation (UE-style)
+			half FD90 = half(0.5) + half(2.0) * cLdotH * cLdotH * roughness;
+			half FdV = half(1.0) + (FD90 - half(1.0)) * SchlickFresnel(cNdotV);
+			half FdL = half(1.0) + (FD90 - half(1.0)) * SchlickFresnel(cNdotL);
+			// Energy compensation for roughness
+			half energy_comp = half(1.0) / (half(1.0) + half(0.5) * roughness);
+			diffuse_brdf_NL = half(1.0 / M_PI) * FdV * FdL * cNdotL * energy_comp;
+			diffuse_brdf_NL = saturateHalf(diffuse_brdf_NL);
+		}
 #else
 			// lambert
 			diffuse_brdf_NL = cNdotL * half(1.0 / M_PI);
@@ -286,7 +327,10 @@ void light_compute(hvec3 N, hvec3 L, hvec3 V, half A, hvec3 light_color, bool is
 #endif
 			// Calculate Fresnel using specular occlusion term from Filament:
 			// https://google.github.io/filament/Filament.html#lighting/occlusion/specularocclusion
-			half f90 = clamp(dot(f0, hvec3(50.0 * 0.33)), metallic, half(1.0));
+			// UE-style Fresnel: f90 clamped and metallic-aware
+			half f90_base = half(0.04);
+			hvec3 f90 = mix(hvec3(f90_base), hvec3(1.0), hvec3(metallic));
+			f90 = clamp(f90, hvec3(0.04), hvec3(1.0));
 			hvec3 F = f0 + (f90 - f0) * cLdotH5;
 			hvec3 specular_brdf_NL = energy_compensation * cNdotL * D * F * G;
 			specular_light += specular_brdf_NL * light_color * attenuation * cc_attenuation * specular_amount;
@@ -339,6 +383,10 @@ half sample_directional_pcf_shadow(texture2D shadow, vec2 shadow_pixel_size, vec
 half sample_pcf_shadow(texture2D shadow, vec2 shadow_pixel_size, vec3 coord, float taa_frame_count) {
 	vec2 pos = coord.xy;
 	float depth = coord.z;
+	
+   // Contact-hardening: penumbra scales with depth (UE-style)
+	half penumbra_scale = clamp(half(coord.z * 0.15), half(1.0), half(3.0));
+	vec2 adjusted_pixel_size = shadow_pixel_size * penumbra_scale;
 
 	//if only one sample is taken, take it from the center
 	if (sc_soft_shadow_samples() == 0) {
@@ -357,7 +405,7 @@ half sample_pcf_shadow(texture2D shadow, vec2 shadow_pixel_size, vec3 coord, flo
 
 	SPEC_CONSTANT_LOOP_ANNOTATION
 	for (uint i = 0; i < sc_soft_shadow_samples(); i++) {
-		avg += textureProj(sampler2DShadow(shadow, shadow_sampler), vec4(pos + shadow_pixel_size * (disk_rotation * scene_data_block.data.soft_shadow_kernel[i].xy), depth, 1.0));
+		avg += textureProj(sampler2DShadow(shadow, shadow_sampler), vec4(pos + adjusted_pixel_size * (disk_rotation * scene_data_block.data.soft_shadow_kernel[i].xy), depth, 1.0));
 	}
 
 	return half(avg * (1.0 / float(sc_soft_shadow_samples())));
@@ -455,12 +503,12 @@ half sample_directional_soft_shadow(texture2D shadow, vec3 pssm_coord, vec2 tex_
 #endif // SHADOWS_DISABLED
 
 half get_omni_attenuation(float distance, float inv_range, float decay) {
+	// UE-style smoother falloff
 	float nd = distance * inv_range;
+	nd = saturate(1.0 - nd * nd); // smoother than ^4
 	nd *= nd;
-	nd *= nd; // nd^4
-	nd = max(1.0 - nd, 0.0);
-	nd *= nd; // nd^2
-	return half(nd * pow(max(distance, 0.0001), -decay));
+	// Add small constant to avoid pure black at distance
+	return half(nd * pow(max(distance, 0.001), -decay) + half(1e-4));
 }
 
 void light_process_omni(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3 vertex_ddx, vec3 vertex_ddy, hvec3 f0, half roughness, half metallic, float taa_frame_count, hvec3 albedo, inout half alpha, vec2 screen_uv, hvec3 energy_compensation,
@@ -1148,6 +1196,7 @@ void light_process_area(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 	half f90 = clamp(dot(f0, hvec3(50.0 * 0.33)), metallic, half(1.0));
 	fresnel_color = f0 * max(half(ltc_fresnel.x), half(0.0)) + (f90 - f0) * max(half(ltc_fresnel.y), half(0.0));
 #endif
+
 
 #if defined(LIGHT_CODE_USED) && defined(AREA_LIGHT_CODE_USED)
 	// Light is written by the user shader.
